@@ -108,6 +108,9 @@ pub enum SubscriptionKey {
     NextToken(u64),
     // Issue #665: pending merchant price proposal for a subscription
     PriceProposal(u64),
+    // Issue #756: pull-payment mandates
+    Mandate(u64),
+    MandateCounter,
 }
 
 #[derive(Clone)]
@@ -259,6 +262,14 @@ pub enum SubscriptionError {
     SkipCapExceeded = 319,
     // Issue #667: exceeded max_pauses_per_year
     PauseLimitExceeded = 320,
+    // Issue #756: pull-payment mandates
+    InvalidMandate = 321,
+    MandateNotFound = 322,
+    MandateRevoked = 323,
+    MandateExpired = 324,
+    MandatePerChargeExceeded = 325,
+    MandateTotalExceeded = 326,
+    MandatePeriodCapExceeded = 327,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -382,7 +393,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=320).contains(&code) {
+            if (300..=327).contains(&code) {
                 return Ok(Error::Subscription(unsafe {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
@@ -534,6 +545,7 @@ impl DataKey {
                 SubscriptionKey::Counter
                     | SubscriptionKey::MeteredCounter
                     | SubscriptionKey::GroupCounter
+                    | SubscriptionKey::MandateCounter
             ),
             DataKey::Feature(k) => matches!(
                 k,
@@ -728,6 +740,31 @@ pub struct PaymentStatusEntry {
 pub struct SubscriptionSkipUsage {
     pub window_start: u64,
     pub count: u32,
+}
+
+/// A customer's standing authorization for a merchant to pull variable
+/// amounts, bounded by per-charge, per-period and lifetime caps (#756).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mandate {
+    pub mandate_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub max_per_charge: i128,
+    pub max_total: i128,
+    pub period_seconds: u64,
+    pub max_per_period: i128,
+    pub expires_at: u64,
+    pub created_at: u64,
+    /// Sum of every charge made against the mandate.
+    pub total_charged: i128,
+    /// Start of the current period; periods are aligned to `created_at`.
+    pub period_start: u64,
+    /// Sum of the charges made in the current period.
+    pub period_charged: i128,
+    pub charge_count: u32,
+    pub revoked: bool,
 }
 
 #[repr(u32)]
@@ -959,6 +996,41 @@ impl soroban_sdk::TryFromVal<soroban_sdk::Env, &Error> for soroban_sdk::Val {
     ) -> Result<Self, soroban_sdk::ConversionError> {
         <_ as soroban_sdk::TryFromVal<soroban_sdk::Env, Error>>::try_from_val(env, *val)
     }
+}
+
+// Issue #756: pull-payment mandates
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MandateCreated {
+    pub mandate_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub max_per_charge: i128,
+    pub max_total: i128,
+    pub period_seconds: u64,
+    pub max_per_period: i128,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MandateCharged {
+    pub mandate_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount: i128,
+    pub memo: String,
+    pub total_charged: i128,
+    pub period_charged: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MandateRevoked {
+    pub mandate_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
 }
 
 #[contractevent]
@@ -2406,6 +2478,8 @@ pub struct PaymentContract;
 // Constants for size limits
 const MAX_METADATA_SIZE: u32 = 512;
 const MAX_NOTES_SIZE: u32 = 1024;
+/// Maximum length, in bytes, of the memo attached to a mandate charge (#756).
+pub const MAX_MANDATE_MEMO_SIZE: u32 = 256;
 const DEFAULT_MAX_RETRIES: u64 = 3;
 const SECONDS_PER_DAY: u64 = 86400;
 const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
@@ -15117,6 +15191,265 @@ impl PaymentContract {
             }
         }
     }
+
+    // ── Issue #756: Pull-payment mandates ────────────────────────────────
+
+    /// Creates a mandate that lets `merchant` pull variable amounts from
+    /// `customer` without a signature per charge.
+    ///
+    /// Charges are pulled with `transfer_from`, so the customer must also
+    /// `approve` this contract on `token` for at least the amount the merchant
+    /// will charge. Periods are aligned to the mandate's creation time.
+    ///
+    /// # Arguments
+    /// * `customer` - The payer (must authorize)
+    /// * `merchant` - The merchant allowed to charge the mandate
+    /// * `token` - The token charges are made in
+    /// * `max_per_charge` - Upper bound on a single charge (`> 0`)
+    /// * `max_total` - Upper bound on the sum of all charges (`> 0`)
+    /// * `period_seconds` - Length of a billing period (`> 0`)
+    /// * `max_per_period` - Upper bound on the sum of charges in one period (`> 0`)
+    /// * `expires_at` - Ledger timestamp from which the mandate can no longer be charged
+    ///
+    /// # Returns
+    /// `Ok(mandate_id)` on success.
+    ///
+    /// # Errors
+    /// - `SubscriptionError::InvalidMandate` if a cap or `period_seconds` is not
+    ///   positive, `expires_at` is not in the future, or `customer == merchant`.
+    /// - `PaymentError::TokenNotAllowed` if `token` is not on the allowlist.
+    /// - The usual pause and merchant registry errors.
+    pub fn create_mandate(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        token: Address,
+        max_per_charge: i128,
+        max_total: i128,
+        period_seconds: u64,
+        max_per_period: i128,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_mandate")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        Self::require_registered_merchant(&env, &merchant)?;
+        customer.require_auth();
+
+        let now = env.ledger().timestamp();
+        if max_per_charge <= 0
+            || max_total <= 0
+            || max_per_period <= 0
+            || period_seconds == 0
+            || expires_at <= now
+            || customer == merchant
+        {
+            return Err(Error::Subscription(SubscriptionError::InvalidMandate));
+        }
+        if !PaymentContract::is_token_allowed(&env, &token) {
+            return Err(Error::Payment(PaymentError::TokenNotAllowed));
+        }
+
+        let counter_key = DataKey::Subscription(SubscriptionKey::MandateCounter);
+        let mandate_id: u64 = env.store().get(&counter_key).unwrap_or(0) + 1;
+        env.store().set(&counter_key, &mandate_id);
+
+        let mandate = Mandate {
+            mandate_id,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            token: token.clone(),
+            max_per_charge,
+            max_total,
+            period_seconds,
+            max_per_period,
+            expires_at,
+            created_at: now,
+            total_charged: 0,
+            period_start: now,
+            period_charged: 0,
+            charge_count: 0,
+            revoked: false,
+        };
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::Mandate(mandate_id)),
+            &mandate,
+        );
+
+        (MandateCreated {
+            mandate_id,
+            customer,
+            merchant,
+            token,
+            max_per_charge,
+            max_total,
+            period_seconds,
+            max_per_period,
+            expires_at,
+        })
+        .publish(&env);
+
+        Ok(mandate_id)
+    }
+
+    /// Charges `amount` against a mandate, pulling it from the customer to the
+    /// merchant. Every cap is checked before any funds move.
+    ///
+    /// When the ledger time has passed the end of the current period, the
+    /// period counter resets and the period start advances to the latest
+    /// period boundary (aligned to the mandate's creation time).
+    ///
+    /// # Arguments
+    /// * `merchant` - The mandate's merchant (must authorize)
+    /// * `mandate_id` - The mandate to charge
+    /// * `amount` - The amount to charge (`> 0`)
+    /// * `memo` - A description of the charge, at most `MAX_MANDATE_MEMO_SIZE` bytes
+    ///
+    /// # Returns
+    /// `Ok(total_charged)`: the mandate's lifetime total after this charge.
+    ///
+    /// # Errors
+    /// - `SubscriptionError::MandateNotFound` if the mandate does not exist.
+    /// - `BasicError::Unauthorized` if `merchant` is not the mandate's merchant.
+    /// - `SubscriptionError::MandateRevoked` / `MandateExpired` if it can no longer be charged.
+    /// - `BasicError::InvalidAmount` if `amount` is not positive.
+    /// - `BasicError::NotesTooLarge` if `memo` is longer than `MAX_MANDATE_MEMO_SIZE`.
+    /// - `SubscriptionError::MandatePerChargeExceeded`, `MandateTotalExceeded` or
+    ///   `MandatePeriodCapExceeded` if the charge breaks a cap.
+    /// - `FeatureError::SpendLimitExceeded` if it breaks the customer's spend limit.
+    /// - `PaymentError::TransferFailed` if the pull fails (e.g. insufficient allowance or balance).
+    pub fn charge_mandate(
+        env: Env,
+        merchant: Address,
+        mandate_id: u64,
+        amount: i128,
+        memo: String,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "charge_mandate")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        merchant.require_auth();
+
+        let key = DataKey::Subscription(SubscriptionKey::Mandate(mandate_id));
+        let mut mandate: Mandate = env
+            .store()
+            .get(&key)
+            .ok_or(Error::Subscription(SubscriptionError::MandateNotFound))?;
+        if mandate.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if mandate.revoked {
+            return Err(Error::Subscription(SubscriptionError::MandateRevoked));
+        }
+        let now = env.ledger().timestamp();
+        if now >= mandate.expires_at {
+            return Err(Error::Subscription(SubscriptionError::MandateExpired));
+        }
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if memo.len() > MAX_MANDATE_MEMO_SIZE {
+            return Err(Error::Basic(BasicError::NotesTooLarge));
+        }
+        if amount > mandate.max_per_charge {
+            return Err(Error::Subscription(
+                SubscriptionError::MandatePerChargeExceeded,
+            ));
+        }
+        let total_charged = mandate
+            .total_charged
+            .checked_add(amount)
+            .filter(|total| *total <= mandate.max_total)
+            .ok_or(Error::Subscription(SubscriptionError::MandateTotalExceeded))?;
+
+        let elapsed = now - mandate.period_start;
+        if elapsed >= mandate.period_seconds {
+            mandate.period_start += elapsed - elapsed % mandate.period_seconds;
+            mandate.period_charged = 0;
+        }
+        let period_charged = mandate
+            .period_charged
+            .checked_add(amount)
+            .filter(|charged| *charged <= mandate.max_per_period)
+            .ok_or(Error::Subscription(
+                SubscriptionError::MandatePeriodCapExceeded,
+            ))?;
+
+        if PaymentContract::check_and_update_spend_limit(&env, &mandate.customer, amount).is_err() {
+            return Err(Error::Feature(FeatureError::SpendLimitExceeded));
+        }
+
+        let transferred = token::Client::new(&env, &mandate.token).try_transfer_from(
+            &env.current_contract_address(),
+            &mandate.customer,
+            &merchant,
+            &amount,
+        );
+        if !matches!(transferred, Ok(Ok(()))) {
+            return Err(Error::Payment(PaymentError::TransferFailed));
+        }
+
+        mandate.total_charged = total_charged;
+        mandate.period_charged = period_charged;
+        mandate.charge_count += 1;
+        env.store().set(&key, &mandate);
+
+        (MandateCharged {
+            mandate_id,
+            customer: mandate.customer,
+            merchant,
+            amount,
+            memo,
+            total_charged,
+            period_charged,
+        })
+        .publish(&env);
+
+        Ok(total_charged)
+    }
+
+    /// Revokes a mandate so it can no longer be charged. Charges already made
+    /// are not affected.
+    ///
+    /// # Arguments
+    /// * `customer` - The mandate's customer (must authorize)
+    /// * `mandate_id` - The mandate to revoke
+    ///
+    /// # Errors
+    /// - `SubscriptionError::MandateNotFound` if the mandate does not exist.
+    /// - `BasicError::Unauthorized` if `customer` is not the mandate's customer.
+    /// - `SubscriptionError::MandateRevoked` if it is already revoked.
+    pub fn revoke_mandate(env: Env, customer: Address, mandate_id: u64) -> Result<(), Error> {
+        customer.require_auth();
+
+        let key = DataKey::Subscription(SubscriptionKey::Mandate(mandate_id));
+        let mut mandate: Mandate = env
+            .store()
+            .get(&key)
+            .ok_or(Error::Subscription(SubscriptionError::MandateNotFound))?;
+        if mandate.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if mandate.revoked {
+            return Err(Error::Subscription(SubscriptionError::MandateRevoked));
+        }
+
+        mandate.revoked = true;
+        env.store().set(&key, &mandate);
+
+        (MandateRevoked {
+            mandate_id,
+            customer,
+            merchant: mandate.merchant,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns a mandate by ID, or `None` if it does not exist.
+    pub fn get_mandate(env: Env, mandate_id: u64) -> Option<Mandate> {
+        env.store()
+            .get(&DataKey::Subscription(SubscriptionKey::Mandate(mandate_id)))
+    }
 }
 
 mod test;
@@ -15188,3 +15521,6 @@ mod test_payment_request;
 
 #[cfg(test)]
 mod test_merchant_registry;
+
+#[cfg(test)]
+mod test_mandates;

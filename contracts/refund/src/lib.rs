@@ -354,6 +354,9 @@ pub enum ExtError {
     InvalidCategoryRefundCap = 78,
     // Issue #810: merchant refund statement
     StatementRangeTooLarge = 79,
+    // Issue #806: bulk promotional voucher issuance
+    EmptyPromotionalBatch = 80,
+    PromotionalBatchTooLarge = 81,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -726,6 +729,28 @@ pub struct VoucherAmountRedeemed {
     pub customer: Address,
     pub amount: i128,
     pub remaining_balance: i128,
+}
+
+// Issue #806: bulk promotional voucher issuance
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromotionalVoucherIssued {
+    pub voucher_id: u64,
+    pub merchant: Address,
+    pub customer: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromotionalVouchersIssued {
+    pub merchant: Address,
+    pub token: Address,
+    pub count: u32,
+    pub total_amount: i128,
+    pub new_reserve_balance: i128,
 }
 
 // Issue #194: Tiered arbitration escalation
@@ -10512,6 +10537,136 @@ impl RefundContract {
             .has(&VoucherKey::NonTransferable(voucher_id))
     }
 
+    // ── Issue #806: Bulk promotional voucher issuance ─────────────────────
+
+    /// Maximum number of vouchers `issue_promotional_vouchers` issues per call.
+    pub const MAX_PROMOTIONAL_BATCH: u32 = 50;
+
+    /// Issue goodwill credit vouchers to many customers at once, funded from
+    /// the merchant's refund reserve for `token`.
+    ///
+    /// The whole batch is validated and the reserve is checked against the
+    /// batch total before any voucher is issued, so a batch either issues
+    /// every voucher or none. Promotional vouchers are not tied to a refund
+    /// and carry `refund_id == 0`; they redeem, partially redeem and transfer
+    /// like any other voucher. Emits `PromotionalVoucherIssued` per voucher
+    /// and one `PromotionalVouchersIssued` for the batch.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant funding the vouchers (must authenticate).
+    /// * `recipients` - `(customer, amount)` pairs; 1 to `MAX_PROMOTIONAL_BATCH` entries.
+    /// * `token` - The reserve token the vouchers pay out in.
+    /// * `expiry_seconds` - Seconds from now until the vouchers expire.
+    ///
+    /// # Returns
+    /// The new voucher IDs, in the same order as `recipients`.
+    ///
+    /// # Errors
+    /// Returns `EmptyPromotionalBatch` if `recipients` is empty.
+    /// Returns `PromotionalBatchTooLarge` if `recipients` exceeds `MAX_PROMOTIONAL_BATCH`.
+    /// Returns `InvalidAmount` if any amount is not positive or the total overflows.
+    /// Returns `InvalidVoucherRecipient` if any recipient is the merchant itself.
+    /// Returns `InsufficientRefundReserve` if the reserve can't cover the batch total.
+    pub fn issue_promotional_vouchers(
+        env: Env,
+        merchant: Address,
+        recipients: Vec<(Address, i128)>,
+        token: Address,
+        expiry_seconds: u64,
+    ) -> Result<Vec<u64>, Error> {
+        Self::require_not_paused(&env, "issue_promotional_vouchers")?;
+        merchant.require_auth();
+
+        let count = recipients.len();
+        if count == 0 {
+            return Err(Error::Ext(ExtError::EmptyPromotionalBatch));
+        }
+        if count > Self::MAX_PROMOTIONAL_BATCH {
+            return Err(Error::Ext(ExtError::PromotionalBatchTooLarge));
+        }
+
+        let mut total: i128 = 0;
+        for (customer, amount) in recipients.iter() {
+            if amount <= 0 {
+                return Err(Error::Core(CoreError::InvalidAmount));
+            }
+            if customer == merchant {
+                return Err(Error::Ext(ExtError::InvalidVoucherRecipient));
+            }
+            total = total
+                .checked_add(amount)
+                .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        }
+
+        // Check the reserve covers the whole batch before issuing anything.
+        let balance = Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone());
+        if total > balance {
+            return Err(Error::Ext(ExtError::InsufficientRefundReserve));
+        }
+        let new_reserve_balance = balance - total;
+        Self::set_refund_reserve(&env, &merchant, &token, new_reserve_balance);
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(expiry_seconds);
+        let non_transferable = !Self::get_vouchers_transferable(env.clone(), merchant.clone());
+        let mut voucher_id: u64 = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::VoucherCounter)
+            .unwrap_or(0);
+        let mut voucher_ids = Vec::new(&env);
+
+        for (customer, amount) in recipients.iter() {
+            voucher_id += 1;
+            let voucher = RefundVoucher {
+                voucher_id,
+                refund_id: 0,
+                customer: customer.clone(),
+                merchant: merchant.clone(),
+                amount,
+                token: token.clone(),
+                issued_at: now,
+                expires_at,
+                redeemed: false,
+            };
+            env.storage()
+                .instance()
+                .set(&VoucherKey::Voucher(voucher_id), &voucher);
+            if non_transferable {
+                env.storage()
+                    .instance()
+                    .set(&VoucherKey::NonTransferable(voucher_id), &true);
+            }
+            Self::add_customer_voucher(&env, &customer, voucher_id);
+            voucher_ids.push_back(voucher_id);
+
+            PromotionalVoucherIssued {
+                voucher_id,
+                merchant: merchant.clone(),
+                customer,
+                token: token.clone(),
+                amount,
+                expires_at,
+            }
+            .publish(&env);
+        }
+
+        env.storage()
+            .instance()
+            .set(&VoucherKey::VoucherCounter, &voucher_id);
+
+        PromotionalVouchersIssued {
+            merchant,
+            token,
+            count,
+            total_amount: total,
+            new_reserve_balance,
+        }
+        .publish(&env);
+
+        Ok(voucher_ids)
+    }
+
     // ── Issue #194: Tiered arbitration escalation ─────────────────────────
 
     /// Add an arbitrator to the senior arbitrator list for tiered escalation.
@@ -11115,6 +11270,9 @@ mod test_refund_statement;
 
 #[cfg(test)]
 mod test_voucher_partial_redemption;
+
+#[cfg(test)]
+mod test_promotional_vouchers;
 
 #[cfg(test)]
 mod test_upgrade;

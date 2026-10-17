@@ -598,6 +598,7 @@ Errors: `SlaNotConfigured` (62) if the refund has no recorded deadline, `SlaNotB
 - `set_vouchers_transferable()` — Merchant chooses whether vouchers for its refunds are issued transferable.
 - `get_vouchers_transferable()` — Whether a merchant's new vouchers are issued transferable (default `true`).
 - `is_voucher_transferable()` — Whether a specific voucher can be transferred.
+- `issue_promotional_vouchers()` — Merchant issues goodwill credit vouchers to many customers at once, funded from its refund reserve.
 
 #### Voucher transfers
 
@@ -648,6 +649,31 @@ Expiry covers the remaining balance. After `expires_at`, neither function can re
 | `ExtError::VoucherInsufficientBalance` | `77` | `amount` is greater than the remaining balance |
 
 Emits `VoucherAmountRedeemed` from `redeem_voucher_amount`. `redeem_voucher_amount` can be paused on its own with `pause_function("redeem_voucher_amount")`.
+
+#### Promotional vouchers
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `issue_promotional_vouchers` | `merchant: Address` (must authorize), `recipients: Vec<(Address, i128)>` (`(customer, amount)` pairs), `token: Address`, `expiry_seconds: u64` | `Result<Vec<u64>, Error>` (new voucher IDs, in `recipients` order) |
+
+`issue_promotional_vouchers` lets a merchant issue goodwill credit without a refund behind it. Every voucher is paid for from the merchant's refund reserve for `token` (see `deposit_refund_reserve()`). A batch may contain at most `MAX_PROMOTIONAL_BATCH` (50) recipients.
+
+The whole batch is validated first. Then the reserve is checked against the batch total. Only after both checks pass are any vouchers issued, so a batch either issues every voucher or none. The reserve is debited by the batch total. The tokens are already held by the contract, so no transfer happens at issuance.
+
+Each voucher expires `expiry_seconds` after the ledger time of the call. Promotional vouchers have `refund_id == 0`, which tells them apart from refund vouchers (refund IDs start at `1`). They work like any other voucher: they can be redeemed with `redeem_refund_voucher()` or `redeem_voucher_amount()`, and transferred subject to the merchant's `set_vouchers_transferable` setting at issue time. A customer may appear more than once in one batch and receives one voucher per entry. The function can be paused on its own with `pause_function("issue_promotional_vouchers")`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::InvalidAmount` | `1` | An amount is zero or negative, or the batch total overflows `i128` |
+| `ExtError::InsufficientRefundReserve` | `67` | The merchant's reserve for `token` is less than the batch total, or the merchant has no reserve in `token` |
+| `ExtError::InvalidVoucherRecipient` | `76` | A recipient is the merchant itself |
+| `ExtError::EmptyPromotionalBatch` | `80` | `recipients` is empty |
+| `ExtError::PromotionalBatchTooLarge` | `81` | `recipients` has more than `MAX_PROMOTIONAL_BATCH` entries |
+
+| Event | Fields | Emitted |
+| --- | --- | --- |
+| `PromotionalVoucherIssued` | `voucher_id`, `merchant`, `customer`, `token`, `amount`, `expires_at` | Once per voucher issued |
+| `PromotionalVouchersIssued` | `merchant`, `token`, `count`, `total_amount`, `new_reserve_balance` | Once per batch, after the vouchers |
 
 #### Voucher expiry and value handling
 
