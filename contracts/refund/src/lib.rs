@@ -350,6 +350,10 @@ pub enum ExtError {
     InvalidVoucherRecipient = 76,
     // Issue #699: partial voucher redemption
     VoucherInsufficientBalance = 77,
+    // Issue #807: category-specific refund percentage caps
+    InvalidCategoryRefundCap = 78,
+    // Issue #810: merchant refund statement
+    StatementRangeTooLarge = 79,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1344,6 +1348,50 @@ pub enum RefundExtKey {
     ScheduledRefundPolicy(Address),
     // Pending merchant counter-offer for a refund.
     CounterOffer(u64),
+    // Issue #807: per-(merchant, category index) refund percentage cap in bps.
+    CategoryRefundCap(Address, u32),
+}
+
+// Issue #807: emitted when a merchant sets a category refund percentage cap.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryRefundCapSet {
+    pub merchant: Address,
+    pub category: PaymentCategory,
+    pub max_bps: u32,
+}
+
+// Issue #810: count and total amount of a merchant's refunds in one status.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct StatusRefundTotals {
+    pub status: RefundStatus,
+    pub count: u64,
+    pub total_amount: i128,
+}
+
+// Issue #810: count and total amount of a merchant's refunds in one token.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct TokenRefundTotals {
+    pub token: Address,
+    pub count: u64,
+    pub total_amount: i128,
+}
+
+// Issue #810: periodic refund statement for merchant accounting.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MerchantRefundStatement {
+    pub merchant: Address,
+    pub from: u64,
+    pub to: u64,
+    pub refund_count: u64,
+    pub total_amount: i128,
+    /// One entry per `RefundStatus`, in declaration order, including zero counts.
+    pub by_status: Vec<StatusRefundTotals>,
+    /// One entry per token seen in the period, in first-seen order.
+    pub by_token: Vec<TokenRefundTotals>,
 }
 
 // Issue #195: Batch decision types
@@ -1370,7 +1418,7 @@ pub struct BatchDecisionResult {
 }
 
 // Issue #197: Payment categories
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum PaymentCategory {
     DigitalGoods,
@@ -4594,6 +4642,149 @@ impl RefundContract {
         Ok(results)
     }
 
+    /// Maximum number of refunds a single statement may cover (#810).
+    pub const MAX_STATEMENT_REFUNDS: u64 = 200;
+
+    /// Build a refund statement for a merchant over `[from, to]` (#810).
+    ///
+    /// Covers refunds whose `requested_at` falls in the range (inclusive,
+    /// ledger timestamps) and returns counts and totals per status and per
+    /// token. The start of the range is found by binary search over the
+    /// merchant's request-ordered index, so cost depends only on the number of
+    /// refunds in the range.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address to report on.
+    /// * `from` - Start of the period (inclusive).
+    /// * `to` - End of the period (inclusive).
+    ///
+    /// # Errors
+    /// Returns `InvalidDateRange` if `from` is after `to`, and
+    /// `StatementRangeTooLarge` if more than `MAX_STATEMENT_REFUNDS` refunds
+    /// fall in the range (split the period into smaller statements).
+    pub fn get_merchant_refund_statement(
+        env: Env,
+        merchant: Address,
+        from: u64,
+        to: u64,
+    ) -> Result<MerchantRefundStatement, Error> {
+        if from > to {
+            return Err(Error::Ext(ExtError::InvalidDateRange));
+        }
+
+        let requested_at = |index: u64| -> Option<u64> {
+            let refund_id = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))?;
+            env.storage()
+                .instance()
+                .get::<_, Refund>(&DataKey::Refund(refund_id))
+                .map(|r| r.requested_at)
+        };
+
+        // First index whose refund was requested at or after `from`.
+        let total = Self::get_merchant_refund_count(&env, &merchant);
+        let (mut lo, mut hi) = (0u64, total);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if requested_at(mid).unwrap_or(0) < from {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        let statuses = [
+            RefundStatus::Requested,
+            RefundStatus::Approved,
+            RefundStatus::Rejected,
+            RefundStatus::Processed,
+            RefundStatus::PendingAppeal,
+            RefundStatus::Withdrawn,
+        ];
+        let mut by_status: Vec<StatusRefundTotals> = Vec::new(&env);
+        for status in statuses.iter() {
+            by_status.push_back(StatusRefundTotals {
+                status: status.clone(),
+                count: 0,
+                total_amount: 0,
+            });
+        }
+        let mut by_token: Vec<TokenRefundTotals> = Vec::new(&env);
+        let mut refund_count = 0u64;
+        let mut total_amount = 0i128;
+
+        let mut index = lo;
+        while index < total {
+            let refund = match env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))
+                .and_then(|id| {
+                    env.storage()
+                        .instance()
+                        .get::<_, Refund>(&DataKey::Refund(id))
+                }) {
+                Some(r) => r,
+                None => {
+                    index += 1;
+                    continue;
+                }
+            };
+            if refund.requested_at > to {
+                break;
+            }
+            if refund.requested_at >= from {
+                if refund_count >= Self::MAX_STATEMENT_REFUNDS {
+                    return Err(Error::Ext(ExtError::StatementRangeTooLarge));
+                }
+                refund_count += 1;
+                total_amount = total_amount.saturating_add(refund.amount);
+
+                for i in 0..by_status.len() {
+                    let mut entry = by_status.get_unchecked(i);
+                    if entry.status == refund.status {
+                        entry.count += 1;
+                        entry.total_amount = entry.total_amount.saturating_add(refund.amount);
+                        by_status.set(i, entry);
+                        break;
+                    }
+                }
+
+                let mut found = false;
+                for i in 0..by_token.len() {
+                    let mut entry = by_token.get_unchecked(i);
+                    if entry.token == refund.token {
+                        entry.count += 1;
+                        entry.total_amount = entry.total_amount.saturating_add(refund.amount);
+                        by_token.set(i, entry);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    by_token.push_back(TokenRefundTotals {
+                        token: refund.token.clone(),
+                        count: 1,
+                        total_amount: refund.amount,
+                    });
+                }
+            }
+            index += 1;
+        }
+
+        Ok(MerchantRefundStatement {
+            merchant,
+            from,
+            to,
+            refund_count,
+            total_amount,
+            by_status,
+            by_token,
+        })
+    }
+
     /// Get all pending (requested) refunds for a merchant.
     ///
     /// # Arguments
@@ -5904,7 +6095,7 @@ impl RefundContract {
         let created_at = payment.created_at;
 
         // Traverse policy inheritance chain to find the effective policy
-        let policy_opt = Self::get_effective_refund_policy(env.clone(), merchant);
+        let policy_opt = Self::get_effective_refund_policy(env.clone(), merchant.clone());
         let policy = match policy_opt {
             Some(p) => p,
             None => return 0,
@@ -5920,7 +6111,13 @@ impl RefundContract {
         // Find the first tier (sorted ascending by days_from_purchase) where days_since_purchase <= tier.days_from_purchase
         for tier in policy.tiers.iter() {
             if days_since_purchase <= tier.days_from_purchase {
-                return tier.max_refund_bps;
+                // Issue #807: a category cap can only lower the tier's limit.
+                return Self::apply_category_refund_cap(
+                    &env,
+                    &merchant,
+                    payment_id,
+                    tier.max_refund_bps,
+                );
             }
         }
 
@@ -6000,6 +6197,9 @@ impl RefundContract {
                 }
             }
         }
+
+        // Issue #807: the category cap combines with the tier by taking the lower.
+        allowed_bps = Self::apply_category_refund_cap(env, merchant, payment_id, allowed_bps);
 
         // Check refund percentage using overflow-safe math
         let refund_percentage_bps = amount
@@ -8703,6 +8903,81 @@ impl RefundContract {
         default_window
     }
 
+    // ── Issue #807: Category-specific refund percentage caps ──────────────────
+
+    /// Set the maximum refund percentage for one of a merchant's categories.
+    ///
+    /// Refunds on payments tagged with `category` are limited to the lower of
+    /// this cap and the policy tier's `max_refund_bps`. Setting `10000` removes
+    /// the effect of the cap.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant setting the cap (must authenticate).
+    /// * `category` - The payment category to cap.
+    /// * `max_bps` - Maximum refund in basis points (0-10000).
+    ///
+    /// # Errors
+    /// Returns `InvalidCategoryRefundCap` if `max_bps` exceeds 10000.
+    ///
+    /// # Events
+    /// Emits `CategoryRefundCapSet`.
+    pub fn set_category_refund_cap(
+        env: Env,
+        merchant: Address,
+        category: PaymentCategory,
+        max_bps: u32,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if max_bps > 10000 {
+            return Err(Error::Ext(ExtError::InvalidCategoryRefundCap));
+        }
+        env.storage().instance().set(
+            &RefundExtKey::CategoryRefundCap(merchant.clone(), category.to_index()),
+            &max_bps,
+        );
+        CategoryRefundCapSet {
+            merchant,
+            category,
+            max_bps,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Get a merchant's refund percentage cap for a category, in basis points.
+    ///
+    /// # Returns
+    /// The cap, or `None` if the merchant has not set one for `category`.
+    pub fn get_category_refund_cap(
+        env: Env,
+        merchant: Address,
+        category: PaymentCategory,
+    ) -> Option<u32> {
+        env.storage()
+            .instance()
+            .get(&RefundExtKey::CategoryRefundCap(
+                merchant,
+                category.to_index(),
+            ))
+    }
+
+    /// Returns `bps` lowered to the cap of the payment's tagged category, if any.
+    fn apply_category_refund_cap(env: &Env, merchant: &Address, payment_id: u64, bps: u32) -> u32 {
+        let cat_idx: Option<u32> = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::PaymentCategoryTag(payment_id));
+        let cap: Option<u32> = cat_idx.and_then(|idx| {
+            env.storage()
+                .instance()
+                .get(&RefundExtKey::CategoryRefundCap(merchant.clone(), idx))
+        });
+        match cap {
+            Some(cap) => bps.min(cap),
+            None => bps,
+        }
+    }
+
     // ── Issue #198: Round-robin arbitrator auto-assignment ─────────────────────
 
     /// Configure the round-robin auto-assignment of arbitrators to cases.
@@ -10831,6 +11106,12 @@ mod test_counter_offer;
 
 #[cfg(test)]
 mod test_voucher_transfer;
+
+#[cfg(test)]
+mod test_category_refund_caps;
+
+#[cfg(test)]
+mod test_refund_statement;
 
 #[cfg(test)]
 mod test_voucher_partial_redemption;

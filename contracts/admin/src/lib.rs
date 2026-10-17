@@ -4,8 +4,17 @@ use payments::PaymentContractClient;
 use refund::RefundContractClient;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
-    String,
+    String, Vec,
 };
+
+/// Schema version of the coordinator itself, reported by `get_platform_versions` (#817).
+pub const ADMIN_SCHEMA_VERSION: u32 = 1;
+
+/// How long a multisig proposal stays approvable/executable after creation (#816).
+pub const PROPOSAL_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Upper bound on the size of the admin set, to bound approval-counting cost.
+pub const MAX_ADMINS: u32 = 20;
 
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
@@ -14,6 +23,15 @@ pub enum Error {
     NotInitialized = 2,
     Unauthorized = 3,
     InvalidFunctionName = 4,
+    // #816: multisig control of the coordinator admin
+    InvalidAdminSet = 5,
+    InvalidThreshold = 6,
+    ProposalNotFound = 7,
+    ProposalExpired = 8,
+    ProposalAlreadyExecuted = 9,
+    AlreadyApproved = 10,
+    ThresholdNotMet = 11,
+    MultisigRequired = 12,
 }
 
 #[contracttype]
@@ -31,6 +49,78 @@ pub enum DataKey {
     PaymentContract,
     EscrowContract,
     RefundContract,
+    // #816: admin set, signature threshold and proposals.
+    Admins,
+    Threshold,
+    ProposalCount,
+    Proposal(u64),
+}
+
+/// A privileged coordinator action that goes through propose/approve/execute (#816).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminAction {
+    SetPaymentContract(Address),
+    SetEscrowContract(Address),
+    SetRefundContract(Address),
+    Upgrade(BytesN<32>),
+    /// Replace the admin set and threshold.
+    SetAdmins(Vec<Address>, u32),
+}
+
+/// A pending or executed multisig proposal (#816).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposal {
+    pub id: u64,
+    pub action: AdminAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+}
+
+/// Schema versions across the platform (#817). A child is `None` when its
+/// address is not set or it could not be queried.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformVersions {
+    pub admin: u32,
+    pub payment: Option<u32>,
+    pub escrow: Option<u32>,
+    pub refund: Option<u32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposalCreated {
+    pub proposal_id: u64,
+    pub proposer: Address,
+    pub action: AdminAction,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposalApproved {
+    pub proposal_id: u64,
+    pub approver: Address,
+    pub approvals: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposalExecuted {
+    pub proposal_id: u64,
+    pub executed_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminSetUpdated {
+    pub admins: Vec<Address>,
+    pub threshold: u32,
 }
 
 /// Event emitted when the coordinator's WASM is replaced in place (#644).
@@ -99,6 +189,142 @@ fn child_contract(env: &Env, target: ChildKind) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)
 }
 
+/// Returns the admin set. Contracts initialized before #816 only stored a
+/// single `Admin`, which is treated as a one-member set.
+fn load_admins(env: &Env) -> Result<Vec<Address>, Error> {
+    if let Some(admins) = env.storage().instance().get(&DataKey::Admins) {
+        return Ok(admins);
+    }
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)?;
+    Ok(Vec::from_array(env, [admin]))
+}
+
+fn load_threshold(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::Threshold)
+        .unwrap_or(1)
+}
+
+/// Verifies `admin` is authenticated and a member of the admin set.
+fn require_admin_member(env: &Env, admin: &Address) -> Result<(), Error> {
+    admin.require_auth();
+    if !load_admins(env)?.contains(admin) {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Direct (single-signature) privileged calls are only allowed while the
+/// threshold is 1; otherwise the action must go through a proposal.
+fn require_single_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    require_admin_member(env, admin)?;
+    if load_threshold(env) > 1 {
+        return Err(Error::MultisigRequired);
+    }
+    Ok(())
+}
+
+fn validate_admin_set(admins: &Vec<Address>, threshold: u32) -> Result<(), Error> {
+    if admins.is_empty() || admins.len() > MAX_ADMINS {
+        return Err(Error::InvalidAdminSet);
+    }
+    for i in 0..admins.len() {
+        for j in (i + 1)..admins.len() {
+            if admins.get_unchecked(i) == admins.get_unchecked(j) {
+                return Err(Error::InvalidAdminSet);
+            }
+        }
+    }
+    if threshold == 0 || threshold > admins.len() {
+        return Err(Error::InvalidThreshold);
+    }
+    Ok(())
+}
+
+fn store_admin_set(env: &Env, admins: Vec<Address>, threshold: u32) {
+    // `Admin` keeps the first member so `get_admin` stays meaningful.
+    env.storage()
+        .instance()
+        .set(&DataKey::Admin, &admins.get_unchecked(0));
+    env.storage().instance().set(&DataKey::Admins, &admins);
+    env.storage()
+        .instance()
+        .set(&DataKey::Threshold, &threshold);
+    AdminSetUpdated { admins, threshold }.publish(env);
+}
+
+fn upgrade_wasm(env: &Env, new_wasm_hash: BytesN<32>, upgraded_by: Address) {
+    env.deployer()
+        .update_current_contract_wasm(new_wasm_hash.clone());
+    (AdminContractUpgraded {
+        new_wasm_hash,
+        upgraded_by,
+    })
+    .publish(env);
+}
+
+fn apply_action(env: &Env, action: AdminAction, executed_by: Address) {
+    match action {
+        AdminAction::SetPaymentContract(addr) => env
+            .storage()
+            .instance()
+            .set(&DataKey::PaymentContract, &addr),
+        AdminAction::SetEscrowContract(addr) => env
+            .storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &addr),
+        AdminAction::SetRefundContract(addr) => env
+            .storage()
+            .instance()
+            .set(&DataKey::RefundContract, &addr),
+        AdminAction::Upgrade(hash) => upgrade_wasm(env, hash, executed_by),
+        AdminAction::SetAdmins(admins, threshold) => store_admin_set(env, admins, threshold),
+    }
+}
+
+fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Proposal(proposal_id))
+        .ok_or(Error::ProposalNotFound)
+}
+
+/// Rejects proposals that already ran or whose approval window has closed.
+fn require_open(env: &Env, proposal: &AdminProposal) -> Result<(), Error> {
+    if proposal.executed {
+        return Err(Error::ProposalAlreadyExecuted);
+    }
+    if env.ledger().timestamp() > proposal.expires_at {
+        return Err(Error::ProposalExpired);
+    }
+    Ok(())
+}
+
+/// Returns the schema version of a child, or `None` if its address is unset
+/// or the call fails.
+fn child_version(env: &Env, target: ChildKind) -> Option<u32> {
+    let child = child_contract(env, target).ok()?;
+    match target {
+        ChildKind::Payment => PaymentContractClient::new(env, &child)
+            .try_get_schema_version()
+            .ok()?
+            .ok(),
+        ChildKind::Escrow => EscrowContractClient::new(env, &child)
+            .try_get_schema_version()
+            .ok()?
+            .ok(),
+        ChildKind::Refund => RefundContractClient::new(env, &child)
+            .try_get_schema_version()
+            .ok()?
+            .ok(),
+    }
+}
+
 #[contract]
 pub struct AdminContract;
 
@@ -115,26 +341,12 @@ impl AdminContract {
     ///
     /// # Errors
     /// Returns `Error::NotInitialized` if the contract has not been initialized,
-    /// and `Error::Unauthorized` if `admin` is not the stored admin.
+    /// `Error::Unauthorized` if `admin` is not in the admin set, and
+    /// `Error::MultisigRequired` if the threshold is above 1 (use
+    /// `propose_action` with `AdminAction::Upgrade` instead).
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
-
-        env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
-        (AdminContractUpgraded {
-            new_wasm_hash,
-            upgraded_by: admin,
-        })
-        .publish(&env);
-
+        require_single_admin(&env, &admin)?;
+        upgrade_wasm(&env, new_wasm_hash, admin);
         Ok(())
     }
 
@@ -167,6 +379,10 @@ impl AdminContract {
         admin.require_auth();
 
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Admins, &Vec::from_array(&env, [admin.clone()]));
+        env.storage().instance().set(&DataKey::Threshold, &1u32);
         env.storage().instance().set(&DataKey::Pauser, &pauser);
         env.storage()
             .instance()
@@ -368,8 +584,9 @@ impl AdminContract {
 
         let child = child_contract(&env, target)?;
         match target {
-            ChildKind::Payment => PaymentContractClient::new(&env, &child)
-                .unpause_function(&pauser, &function_name),
+            ChildKind::Payment => {
+                PaymentContractClient::new(&env, &child).unpause_function(&pauser, &function_name)
+            }
             ChildKind::Escrow => {
                 EscrowContractClient::new(&env, &child).unpause_function(&pauser, &function_name)
             }
@@ -397,23 +614,14 @@ impl AdminContract {
     ///
     /// # Errors
     /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
-    /// and `Error::Unauthorized` if the provided admin address does not match the
-    /// stored admin.
+    /// `Error::Unauthorized` if the provided admin address is not in the admin set,
+    /// and `Error::MultisigRequired` if the threshold is above 1.
     pub fn set_payment_contract(
         env: Env,
         admin: Address,
         payment_contract: Address,
     ) -> Result<(), Error> {
-        admin.require_auth();
-
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
+        require_single_admin(&env, &admin)?;
 
         env.storage()
             .instance()
@@ -430,23 +638,14 @@ impl AdminContract {
     ///
     /// # Errors
     /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
-    /// and `Error::Unauthorized` if the provided admin address does not match the
-    /// stored admin.
+    /// `Error::Unauthorized` if the provided admin address is not in the admin set,
+    /// and `Error::MultisigRequired` if the threshold is above 1.
     pub fn set_escrow_contract(
         env: Env,
         admin: Address,
         escrow_contract: Address,
     ) -> Result<(), Error> {
-        admin.require_auth();
-
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
+        require_single_admin(&env, &admin)?;
 
         env.storage()
             .instance()
@@ -463,23 +662,14 @@ impl AdminContract {
     ///
     /// # Errors
     /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
-    /// and `Error::Unauthorized` if the provided admin address does not match the
-    /// stored admin.
+    /// `Error::Unauthorized` if the provided admin address is not in the admin set,
+    /// and `Error::MultisigRequired` if the threshold is above 1.
     pub fn set_refund_contract(
         env: Env,
         admin: Address,
         refund_contract: Address,
     ) -> Result<(), Error> {
-        admin.require_auth();
-
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
+        require_single_admin(&env, &admin)?;
 
         env.storage()
             .instance()
@@ -488,7 +678,198 @@ impl AdminContract {
         Ok(())
     }
 
-    /// Returns the current admin address.
+    /// Replaces the admin set and signature threshold directly (#816).
+    ///
+    /// Only allowed while the current threshold is 1, so a single admin can
+    /// bootstrap a multisig; afterwards use `AdminAction::SetAdmins`.
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `MultisigRequired`, `InvalidAdminSet`
+    /// (empty, duplicated, or more than `MAX_ADMINS` members) and
+    /// `InvalidThreshold` (zero or above the number of admins).
+    ///
+    /// # Events
+    /// Emits `AdminSetUpdated`.
+    pub fn set_admins(
+        env: Env,
+        admin: Address,
+        admins: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        require_single_admin(&env, &admin)?;
+        validate_admin_set(&admins, threshold)?;
+        store_admin_set(&env, admins, threshold);
+        Ok(())
+    }
+
+    /// Proposes a privileged action (#816). The proposer's approval is
+    /// recorded immediately; the proposal expires after `PROPOSAL_TTL_SECONDS`.
+    ///
+    /// # Returns
+    /// The new proposal id.
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized` (proposer not in the admin set), and for
+    /// `SetAdmins`, `InvalidAdminSet` / `InvalidThreshold`.
+    ///
+    /// # Events
+    /// Emits `AdminProposalCreated`.
+    pub fn propose_action(env: Env, proposer: Address, action: AdminAction) -> Result<u64, Error> {
+        require_admin_member(&env, &proposer)?;
+        if let AdminAction::SetAdmins(admins, threshold) = &action {
+            validate_admin_set(admins, *threshold)?;
+        }
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0u64)
+            + 1;
+        let created_at = env.ledger().timestamp();
+        let expires_at = created_at.saturating_add(PROPOSAL_TTL_SECONDS);
+        let proposal = AdminProposal {
+            id,
+            action: action.clone(),
+            proposer: proposer.clone(),
+            approvals: Vec::from_array(&env, [proposer.clone()]),
+            created_at,
+            expires_at,
+            executed: false,
+        };
+        env.storage().instance().set(&DataKey::ProposalCount, &id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(id), &proposal);
+
+        AdminProposalCreated {
+            proposal_id: id,
+            proposer,
+            action,
+            expires_at,
+        }
+        .publish(&env);
+
+        Ok(id)
+    }
+
+    /// Adds `approver`'s approval to an open proposal (#816).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `ProposalNotFound`,
+    /// `ProposalAlreadyExecuted`, `ProposalExpired` and `AlreadyApproved`.
+    ///
+    /// # Events
+    /// Emits `AdminProposalApproved`.
+    pub fn approve_action(env: Env, approver: Address, proposal_id: u64) -> Result<(), Error> {
+        require_admin_member(&env, &approver)?;
+        let mut proposal = load_proposal(&env, proposal_id)?;
+        require_open(&env, &proposal)?;
+        if proposal.approvals.contains(&approver) {
+            return Err(Error::AlreadyApproved);
+        }
+
+        proposal.approvals.push_back(approver.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        AdminProposalApproved {
+            proposal_id,
+            approver,
+            approvals: proposal.approvals.len(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Executes a proposal once approvals from current admins reach the
+    /// threshold (#816). Approvals from addresses removed from the admin set
+    /// since they approved do not count.
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `ProposalNotFound`,
+    /// `ProposalAlreadyExecuted`, `ProposalExpired` and `ThresholdNotMet`.
+    ///
+    /// # Events
+    /// Emits `AdminProposalExecuted`, plus the action's own event
+    /// (`AdminContractUpgraded` or `AdminSetUpdated`) where it has one.
+    pub fn execute_action(env: Env, executor: Address, proposal_id: u64) -> Result<(), Error> {
+        require_admin_member(&env, &executor)?;
+        let mut proposal = load_proposal(&env, proposal_id)?;
+        require_open(&env, &proposal)?;
+
+        let admins = load_admins(&env)?;
+        let valid_approvals = proposal
+            .approvals
+            .iter()
+            .filter(|a| admins.contains(a))
+            .count() as u32;
+        if valid_approvals < load_threshold(&env) {
+            return Err(Error::ThresholdNotMet);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        apply_action(&env, proposal.action, executor.clone());
+
+        AdminProposalExecuted {
+            proposal_id,
+            executed_by: executor,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns a proposal by id (#816).
+    ///
+    /// # Errors
+    /// `ProposalNotFound` if no proposal has that id.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<AdminProposal, Error> {
+        load_proposal(&env, proposal_id)
+    }
+
+    /// Returns the admin set (#816).
+    ///
+    /// # Errors
+    /// `NotInitialized` if the contract has not been initialized.
+    pub fn get_admins(env: Env) -> Result<Vec<Address>, Error> {
+        load_admins(&env)
+    }
+
+    /// Returns the signature threshold (#816).
+    ///
+    /// # Errors
+    /// `NotInitialized` if the contract has not been initialized.
+    pub fn get_threshold(env: Env) -> Result<u32, Error> {
+        load_admins(&env)?;
+        Ok(load_threshold(&env))
+    }
+
+    /// Returns the coordinator's own schema version (#817).
+    pub fn get_schema_version(_env: Env) -> u32 {
+        ADMIN_SCHEMA_VERSION
+    }
+
+    /// Returns the coordinator's version and each child's `get_schema_version` (#817).
+    ///
+    /// Never fails: a child whose address is not set, or whose call fails,
+    /// is reported as `None`.
+    pub fn get_platform_versions(env: Env) -> PlatformVersions {
+        PlatformVersions {
+            admin: ADMIN_SCHEMA_VERSION,
+            payment: child_version(&env, ChildKind::Payment),
+            escrow: child_version(&env, ChildKind::Escrow),
+            refund: child_version(&env, ChildKind::Refund),
+        }
+    }
+
+    /// Returns the current admin address (the first member of the admin set).
     ///
     /// # Returns
     /// The `Address` of the current admin.
@@ -551,7 +932,7 @@ impl AdminContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn setup_payment(env: &Env, admin: &Address) -> Address {
         let contract_id = env.register(payments::PaymentContract, ());
@@ -878,5 +1259,254 @@ mod test {
         assert_eq!(contracts.payment, new_payment);
         assert_eq!(contracts.escrow, new_escrow);
         assert_eq!(contracts.refund, new_refund);
+    }
+
+    /// Turns the single-admin setup into a 2-of-3 multisig.
+    fn setup_multisig(env: &Env) -> (AdminContractClient<'_>, Address, Address, Address, Address) {
+        let (client, admin, pauser, _, _, _) = setup_initialized(env);
+        let a2 = Address::generate(env);
+        let a3 = Address::generate(env);
+        client.set_admins(
+            &admin,
+            &Vec::from_array(env, [admin.clone(), a2.clone(), a3.clone()]),
+            &2,
+        );
+        (client, admin, a2, a3, pauser)
+    }
+
+    #[test]
+    fn test_initialize_sets_single_member_admin_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _, _, _, _) = setup_initialized(&env);
+        assert_eq!(client.get_admins(), Vec::from_array(&env, [admin]));
+        assert_eq!(client.get_threshold(), 1);
+    }
+
+    #[test]
+    fn test_set_admins_validates_set_and_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _, _, _, _) = setup_initialized(&env);
+        let a2 = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_admins(&admin, &Vec::new(&env), &1),
+            Err(Ok(Error::InvalidAdminSet))
+        );
+        assert_eq!(
+            client.try_set_admins(
+                &admin,
+                &Vec::from_array(&env, [admin.clone(), admin.clone()]),
+                &1
+            ),
+            Err(Ok(Error::InvalidAdminSet))
+        );
+        let set = Vec::from_array(&env, [admin.clone(), a2.clone()]);
+        assert_eq!(
+            client.try_set_admins(&admin, &set, &0),
+            Err(Ok(Error::InvalidThreshold))
+        );
+        assert_eq!(
+            client.try_set_admins(&admin, &set, &3),
+            Err(Ok(Error::InvalidThreshold))
+        );
+        assert_eq!(
+            client.try_set_admins(&a2, &set, &2),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_direct_privileged_calls_blocked_above_threshold_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, _, pauser) = setup_multisig(&env);
+        let new_payment = setup_payment(&env, &pauser);
+
+        assert_eq!(
+            client.try_set_payment_contract(&admin, &new_payment),
+            Err(Ok(Error::MultisigRequired))
+        );
+        assert_eq!(
+            client.try_set_escrow_contract(&a2, &new_payment),
+            Err(Ok(Error::MultisigRequired))
+        );
+        assert_eq!(
+            client.try_set_refund_contract(&admin, &new_payment),
+            Err(Ok(Error::MultisigRequired))
+        );
+        assert_eq!(
+            client.try_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
+            Err(Ok(Error::MultisigRequired))
+        );
+        assert_eq!(
+            client.try_set_admins(&admin, &Vec::from_array(&env, [admin.clone()]), &1),
+            Err(Ok(Error::MultisigRequired))
+        );
+    }
+
+    #[test]
+    fn test_proposal_below_threshold_cannot_execute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, _, pauser) = setup_multisig(&env);
+        let old_payment = client.get_contracts().payment;
+        let new_payment = setup_payment(&env, &pauser);
+
+        let id = client.propose_action(
+            &admin,
+            &AdminAction::SetPaymentContract(new_payment.clone()),
+        );
+        assert_eq!(
+            client.try_execute_action(&admin, &id),
+            Err(Ok(Error::ThresholdNotMet))
+        );
+        assert_eq!(client.get_contracts().payment, old_payment);
+
+        assert_eq!(
+            client.try_approve_action(&admin, &id),
+            Err(Ok(Error::AlreadyApproved))
+        );
+        client.approve_action(&a2, &id);
+        client.execute_action(&a2, &id);
+        assert_eq!(client.get_contracts().payment, new_payment);
+        assert!(client.get_proposal(&id).executed);
+
+        assert_eq!(
+            client.try_execute_action(&admin, &id),
+            Err(Ok(Error::ProposalAlreadyExecuted))
+        );
+    }
+
+    #[test]
+    fn test_non_admin_cannot_propose_approve_or_execute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _, _, pauser) = setup_multisig(&env);
+        let stranger = Address::generate(&env);
+        let action = AdminAction::SetRefundContract(stranger.clone());
+
+        assert_eq!(
+            client.try_propose_action(&pauser, &action),
+            Err(Ok(Error::Unauthorized))
+        );
+        let id = client.propose_action(&admin, &action);
+        assert_eq!(
+            client.try_approve_action(&stranger, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            client.try_execute_action(&stranger, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            client.try_approve_action(&admin, &99),
+            Err(Ok(Error::ProposalNotFound))
+        );
+    }
+
+    #[test]
+    fn test_proposals_expire() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, a3, pauser) = setup_multisig(&env);
+        let new_escrow = setup_escrow(&env, &pauser);
+
+        let id = client.propose_action(&admin, &AdminAction::SetEscrowContract(new_escrow));
+        client.approve_action(&a2, &id);
+
+        let expires_at = client.get_proposal(&id).expires_at;
+        env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+
+        assert_eq!(
+            client.try_approve_action(&a3, &id),
+            Err(Ok(Error::ProposalExpired))
+        );
+        assert_eq!(
+            client.try_execute_action(&admin, &id),
+            Err(Ok(Error::ProposalExpired))
+        );
+    }
+
+    #[test]
+    fn test_set_admins_via_proposal_and_removed_approvals_do_not_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, a3, pauser) = setup_multisig(&env);
+        let new_refund = setup_refund(&env, &pauser);
+
+        // a3 approves a pending action, then is removed from the set.
+        let pending = client.propose_action(&a3, &AdminAction::SetRefundContract(new_refund));
+
+        let new_set = Vec::from_array(&env, [admin.clone(), a2.clone()]);
+        let id = client.propose_action(&admin, &AdminAction::SetAdmins(new_set.clone(), 2));
+        client.approve_action(&a2, &id);
+        client.execute_action(&admin, &id);
+        assert_eq!(client.get_admins(), new_set);
+        assert_eq!(client.get_threshold(), 2);
+
+        // Only a3's (now stale) approval exists, so the threshold is not met.
+        assert_eq!(
+            client.try_execute_action(&admin, &pending),
+            Err(Ok(Error::ThresholdNotMet))
+        );
+
+        // Invalid SetAdmins proposals are rejected up front.
+        assert_eq!(
+            client.try_propose_action(&admin, &AdminAction::SetAdmins(new_set, 5)),
+            Err(Ok(Error::InvalidThreshold))
+        );
+    }
+
+    #[test]
+    fn test_pauser_stays_single_key_under_multisig() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, _, pauser) = setup_multisig(&env);
+        client.emergency_pause_all(&pauser, &String::from_str(&env, "incident"));
+        let payment = PaymentContractClient::new(&env, &client.get_contracts().payment);
+        assert!(payment.get_pause_state().globally_paused);
+    }
+
+    #[test]
+    fn test_get_platform_versions_aggregates_children() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, payment, escrow, refund) = setup_initialized(&env);
+
+        let versions = client.get_platform_versions();
+        assert_eq!(versions.admin, ADMIN_SCHEMA_VERSION);
+        assert_eq!(versions.admin, client.get_schema_version());
+        assert_eq!(
+            versions.payment,
+            Some(PaymentContractClient::new(&env, &payment).get_schema_version())
+        );
+        assert_eq!(
+            versions.escrow,
+            Some(EscrowContractClient::new(&env, &escrow).get_schema_version())
+        );
+        assert_eq!(
+            versions.refund,
+            Some(RefundContractClient::new(&env, &refund).get_schema_version())
+        );
+    }
+
+    #[test]
+    fn test_get_platform_versions_handles_unset_children() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+        assert_eq!(
+            fresh.get_platform_versions(),
+            PlatformVersions {
+                admin: ADMIN_SCHEMA_VERSION,
+                payment: None,
+                escrow: None,
+                refund: None,
+            }
+        );
     }
 }

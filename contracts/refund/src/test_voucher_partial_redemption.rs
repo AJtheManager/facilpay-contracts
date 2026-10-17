@@ -99,8 +99,10 @@ fn multiple_partial_redemptions_mark_voucher_redeemed_at_zero() {
     let s = setup();
     let voucher_id = issue_voucher(&s, 1, VALUE);
 
-    s.client.redeem_voucher_amount(&s.customer, &voucher_id, &250);
-    s.client.redeem_voucher_amount(&s.customer, &voucher_id, &250);
+    s.client
+        .redeem_voucher_amount(&s.customer, &voucher_id, &250);
+    s.client
+        .redeem_voucher_amount(&s.customer, &voucher_id, &250);
     let remaining = s
         .client
         .redeem_voucher_amount(&s.customer, &voucher_id, &500);
@@ -121,7 +123,8 @@ fn multiple_partial_redemptions_mark_voucher_redeemed_at_zero() {
 fn redemption_above_remaining_balance_is_rejected() {
     let s = setup();
     let voucher_id = issue_voucher(&s, 1, VALUE);
-    s.client.redeem_voucher_amount(&s.customer, &voucher_id, &600);
+    s.client
+        .redeem_voucher_amount(&s.customer, &voucher_id, &600);
 
     assert_eq!(
         s.client
@@ -148,7 +151,8 @@ fn redemption_above_voucher_value_is_rejected() {
 fn full_redeem_after_partial_pays_only_remaining_balance() {
     let s = setup();
     let voucher_id = issue_voucher(&s, 1, VALUE);
-    s.client.redeem_voucher_amount(&s.customer, &voucher_id, &400);
+    s.client
+        .redeem_voucher_amount(&s.customer, &voucher_id, &400);
 
     s.client.redeem_refund_voucher(&s.customer, &voucher_id, &1);
 
@@ -178,11 +182,13 @@ fn expiry_applies_to_remaining_balance() {
     let s = setup();
     let voucher_id = issue_voucher(&s, 1, VALUE);
     let expires_at = s.client.get_voucher(&voucher_id).unwrap().expires_at;
-    s.client.redeem_voucher_amount(&s.customer, &voucher_id, &200);
+    s.client
+        .redeem_voucher_amount(&s.customer, &voucher_id, &200);
 
     // Still redeemable at the exact expiry boundary.
     s.env.ledger().set_timestamp(expires_at);
-    s.client.redeem_voucher_amount(&s.customer, &voucher_id, &100);
+    s.client
+        .redeem_voucher_amount(&s.customer, &voucher_id, &100);
 
     s.env.ledger().set_timestamp(expires_at + 1);
     assert_eq!(
@@ -216,7 +222,8 @@ fn remaining_balance_follows_voucher_on_transfer() {
     let s = setup();
     let voucher_id = issue_voucher(&s, 1, VALUE);
     let new_owner = Address::generate(&s.env);
-    s.client.redeem_voucher_amount(&s.customer, &voucher_id, &300);
+    s.client
+        .redeem_voucher_amount(&s.customer, &voucher_id, &300);
     s.client
         .transfer_voucher(&s.customer, &voucher_id, &new_owner);
 
