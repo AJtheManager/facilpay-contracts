@@ -529,6 +529,62 @@ other caller ⇒ `Unauthorized`) and sets `billing_cap = Some(cap)` for all futu
 - Usage accumulated but not yet billed when a cycle "should" have ended is never lost — the
   next `execute_metered_billing` still charges for all of it.
 
+### Pull-Payment Mandates (Issue #756)
+
+A mandate lets a customer authorize a merchant to charge variable amounts, without the customer signing each charge. Each charge must stay within a per-charge cap, a per-period cap and a lifetime cap.
+
+| Function | Description |
+| --- | --- |
+| `create_mandate(customer, merchant, token, max_per_charge, max_total, period_seconds, max_per_period, expires_at)` | Customer (must authorize) creates a mandate. Returns the `mandate_id`. |
+| `charge_mandate(merchant, mandate_id, amount, memo)` | The mandate's merchant (must authorize) charges `amount`. Returns the mandate's lifetime `total_charged` after the charge. |
+| `revoke_mandate(customer, mandate_id)` | Customer (must authorize) revokes the mandate. Charges already made are not affected. |
+| `get_mandate(mandate_id)` | Returns the `Mandate`, or `None` if it does not exist. |
+
+#### Parameters
+
+| Parameter | Rule |
+| --- | --- |
+| `max_per_charge` | `> 0`. Upper bound on a single charge. |
+| `max_total` | `> 0`. Upper bound on the sum of all charges over the mandate's life. |
+| `period_seconds` | `> 0`. Length of a billing period. Periods are aligned to the mandate's creation time. |
+| `max_per_period` | `> 0`. Upper bound on the sum of charges within one period. |
+| `expires_at` | Ledger timestamp in the future. The mandate can be charged while `now < expires_at`. |
+| `memo` | Description of the charge, at most `MAX_MANDATE_MEMO_SIZE` (256) bytes. |
+
+#### How Mandates Work
+
+- **Funding.** Charges are pulled with `transfer_from`, as with recurring subscriptions. The customer must also `approve` the payment contract on `token` for at least the amount the merchant will charge. If the pull fails (allowance or balance too low), the charge returns `TransferFailed` and the mandate is unchanged. No platform fee is taken.
+- **Caps.** Every cap is checked before any funds move. A charge that would exceed any cap is rejected, and nothing is recorded.
+- **Period reset.** When the ledger time reaches the end of the current period, the next charge resets the period counter. The period start moves to the latest boundary, `created_at + k * period_seconds`, so skipped periods do not shift the schedule.
+- **Revocation and expiry.** A revoked mandate, or one at or past `expires_at`, cannot be charged.
+- The customer's spend limit, the token allowlist, the contract and merchant pause flags, and the merchant registry requirement all apply.
+
+#### Errors
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `charge_mandate` caller is not the mandate's merchant, or `revoke_mandate` caller is not its customer |
+| `BasicError::NotesTooLarge` | `102` | `memo` is longer than `MAX_MANDATE_MEMO_SIZE` |
+| `BasicError::InvalidAmount` | `121` | `amount` is zero or negative |
+| `PaymentError::TransferFailed` | `206` | The `transfer_from` pull failed |
+| `PaymentError::TokenNotAllowed` | `224` | `token` is not on the allowlist |
+| `SubscriptionError::InvalidMandate` | `321` | A cap or `period_seconds` is not positive, `expires_at` is not in the future, or `customer == merchant` |
+| `SubscriptionError::MandateNotFound` | `322` | No mandate with this ID |
+| `SubscriptionError::MandateRevoked` | `323` | The mandate was revoked (also returned when revoking it twice) |
+| `SubscriptionError::MandateExpired` | `324` | Ledger time is at or past `expires_at` |
+| `SubscriptionError::MandatePerChargeExceeded` | `325` | `amount > max_per_charge` |
+| `SubscriptionError::MandateTotalExceeded` | `326` | The charge would take `total_charged` above `max_total` |
+| `SubscriptionError::MandatePeriodCapExceeded` | `327` | The charge would take the current period's total above `max_per_period` |
+| `FeatureError::SpendLimitExceeded` | `527` | The charge would exceed the customer's spend limit |
+
+#### Events
+
+| Event | Fields | Emitted by |
+| --- | --- | --- |
+| `MandateCreated` | `mandate_id`, `customer`, `merchant`, `token`, `max_per_charge`, `max_total`, `period_seconds`, `max_per_period`, `expires_at` | `create_mandate` |
+| `MandateCharged` | `mandate_id`, `customer`, `merchant`, `amount`, `memo`, `total_charged`, `period_charged` | `charge_mandate` |
+| `MandateRevoked` | `mandate_id`, `customer`, `merchant` | `revoke_mandate` |
+
 ### Dunning (Failed Payment Recovery)
 
 | Function                                           | Description                                                                              |
