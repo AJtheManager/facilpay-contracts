@@ -11537,7 +11537,9 @@ impl PaymentContract {
         }
         let profile: MerchantProfile = env
             .store()
-            .get(&DataKey::Merchant(MerchantDataKey::Profile(merchant.clone())))
+            .get(&DataKey::Merchant(MerchantDataKey::Profile(
+                merchant.clone(),
+            )))
             .ok_or(Error::Payment(PaymentError::MerchantNotRegistered))?;
         if !profile.active {
             return Err(Error::Payment(PaymentError::MerchantInactive));

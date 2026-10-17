@@ -289,6 +289,7 @@ Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and 
 - `get_merchant_refunds()` — Paginated refunds for a specific merchant.
 - `get_merchant_refunds_by_status()` — Paginated refunds for a merchant filtered by status.
 - `get_merchant_refunds_in_range(merchant, from, to, limit, offset)` — Paginated refunds for a merchant whose `requested_at` falls in `[from, to]` (inclusive ledger timestamps), in request order. Returns `InvalidDateRange` (66) if `from > to`.
+- `get_merchant_refund_statement(merchant, from, to)` — Accounting statement for a period. See [Merchant Refund Statement](#merchant-refund-statement).
 - `get_merchant_pending_refunds()` — All pending refunds for a merchant.
 - `get_merchant_refund_summary()` — Aggregate refund stats for a merchant.
 - `get_refunds_by_reason_code()` — Paginated refunds filtered by canonical reason code.
@@ -480,6 +481,50 @@ to request again.
 - `get_category_window()` — Gets the category-specific refund window.
 - `tag_payment_category()` — Merchant tags a payment with a category.
 - `get_effective_window()` — Gets the effective refund window for a payment.
+
+### Category Refund Caps
+
+Different product categories can have different refund percentage limits. A category cap applies to payments tagged with that category via `tag_payment_category()`.
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `set_category_refund_cap` | `merchant: Address`, `category: PaymentCategory`, `max_bps: u32` | `Result<(), Error>` | `merchant` |
+| `get_category_refund_cap` | `merchant: Address`, `category: PaymentCategory` | `Option<u32>` (`None` if not set) | — |
+
+- `max_bps` is in basis points (0–10000). Setting `10000` removes the effect of the cap.
+- **Combining with policy tiers:** the effective limit is the **lower** of the category cap and the policy tier's `max_refund_bps` (after any customer tier override). This applies both to `get_applicable_refund_bps()` and to the validation done in `request_refund()`, which fails with `RefundExceedsPolicy` (12) above the limit.
+- Untagged payments, and categories without a cap, use the policy tier alone.
+- Caps are per merchant.
+
+**Errors:** `InvalidCategoryRefundCap` (78) if `max_bps > 10000`.
+
+**Event:** `CategoryRefundCapSet { merchant, category, max_bps }`.
+
+### Merchant Refund Statement
+
+`get_merchant_refund_statement(merchant: Address, from: u64, to: u64) -> Result<MerchantRefundStatement, Error>`
+
+Aggregates the merchant's refunds whose `requested_at` falls in `[from, to]` (inclusive ledger timestamps). It returns the same refunds as `get_merchant_refunds_in_range`, so its totals match summing those refunds individually.
+
+```rust
+pub struct MerchantRefundStatement {
+    pub merchant: Address,
+    pub from: u64,
+    pub to: u64,
+    pub refund_count: u64,
+    pub total_amount: i128,                 // sum of `amount` over all refunds in range
+    pub by_status: Vec<StatusRefundTotals>, // one entry per RefundStatus, zeros included
+    pub by_token: Vec<TokenRefundTotals>,   // one entry per token seen, first-seen order
+}
+pub struct StatusRefundTotals { pub status: RefundStatus, pub count: u64, pub total_amount: i128 }
+pub struct TokenRefundTotals  { pub token: Address,       pub count: u64, pub total_amount: i128 }
+```
+
+**Cost bound:** the start of the range is found by binary search over the merchant's request-ordered index, and a statement may cover at most `MAX_STATEMENT_REFUNDS` (200) refunds. For busier periods, request several shorter statements.
+
+**Errors:** `InvalidDateRange` (66) if `from > to`, `StatementRangeTooLarge` (79) if more than 200 refunds fall in the range.
+
+**Events:** none (read-only).
 
 ### Arbitrator Auto-Assignment
 
@@ -777,6 +822,8 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | Event                                       | Topic Name | Payload Fields | Fires When                                                           |
 | ------------------------------------------- | ---------- | -------------- | -------------------------------------------------------------------- |
 | (Policy changes tracked via function calls) | —          | —              | Use `get_refund_policy_history()` to audit policy versions over time |
+
+| `CategoryRefundCapSet` | `category_refund_cap_set` | `merchant`, `category`, `max_bps` | `set_category_refund_cap()` |
 
 ### Eligibility & Tier Policy Events
 
