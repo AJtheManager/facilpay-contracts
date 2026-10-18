@@ -1737,6 +1737,8 @@ pub enum EscrowEventType {
     Disputed,
     Resolved,
     Refunded,
+    Cancelled,
+    StatusChanged,
 }
 
 #[derive(Clone)]
@@ -1770,6 +1772,18 @@ pub struct EscrowHookInvocationFailed {
     pub subscriber: Address,
     pub event_type: EscrowEventType,
     pub escrow_id: u64,
+}
+
+// ── Unified EscrowStatusChanged event ─────────────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowStatusChanged {
+    pub escrow_id: u64,
+    pub old_status: EscrowStatus,
+    pub new_status: EscrowStatus,
+    pub changed_by: Address,
+    pub timestamp: u64,
 }
 
 // ── Issue #684: Mutual cancellation events ───────────────────────────────────
@@ -4568,8 +4582,19 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        // Emit unified status change event
+        EscrowStatusChanged {
+            escrow_id,
+            old_status: EscrowStatus::Locked,
+            new_status: EscrowStatus::Released,
+            changed_by: _admin.clone(),
+            timestamp: current_time,
+        }
+        .publish(&env);
+
         // Issue #686: notify hooks
         Self::invoke_escrow_hooks(&env, EscrowEventType::Released, escrow_id);
+        Self::invoke_escrow_hooks(&env, EscrowEventType::StatusChanged, escrow_id);
 
         Ok(())
     }
@@ -13406,6 +13431,235 @@ impl EscrowContract {
         }
 
         hooks
+    }
+
+    // ── Feature: Edit multi-party participants before funding ────────────────────
+
+    /// Edits participants in a multi-party escrow before it is funded.
+    ///
+    /// Only the creator (customer) can modify participants, and only while the
+    /// escrow is still in `Locked` status and before any approvals have been made.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `caller` - Address of the creator who initiated the escrow.
+    /// * `escrow_id` - Identifier for the multi-party escrow.
+    /// * `participants` - New list of participants (must meet same validation as creation).
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns `Err(Error)` when:
+    /// - Escrow not found
+    /// - Caller is not the original customer/creator
+    /// - Escrow has already received approvals
+    /// - Escrow is not in Locked status
+    /// - Participants validation fails (duplicates, invalid shares/weights)
+    pub fn edit_multiparty_participants(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        participants: Vec<Participant>,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "edit_multiparty_participants")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let mut escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)))
+            .unwrap();
+
+        // Only allow edits by the original creator
+        // We consider the first participant with Customer role as the creator
+        let creator = escrow
+            .participants
+            .iter()
+            .find(|p| matches!(p.role, ParticipantRole::Customer))
+            .map(|p| p.address.clone())
+            .ok_or(Error::Basic(BasicError::Unauthorized))?;
+
+        if caller != creator {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Only allow edits if no approvals have been made yet
+        if !escrow.approvals.is_empty() {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
+
+        // Only allow edits if escrow is still Locked
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        // Validate new participants (same rules as creation)
+        if participants.len() < 2 || participants.len() > 10 {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        // Check for duplicate addresses
+        for i in 0..participants.len() {
+            let addr_i = participants.get(i).unwrap().address;
+            for j in (i + 1)..participants.len() {
+                if participants.get(j).unwrap().address == addr_i {
+                    return Err(Error::Basic(BasicError::DuplicateApproval));
+                }
+            }
+        }
+
+        // Ensure shares sum to 10000 bps
+        let mut total_shares: u32 = 0;
+        let mut total_weights: u32 = 0;
+        for p in participants.iter() {
+            total_shares += p.share_bps;
+            total_weights += p.weight_bps;
+        }
+        if total_shares != 10000 {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        if total_weights != 10000 {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        // Normalize participants (ensure approved=false, approved_at=None)
+        let mut normalized = Vec::new(&env);
+        for p in participants.iter() {
+            normalized.push_back(Participant {
+                address: p.address.clone(),
+                role: p.role.clone(),
+                share_bps: p.share_bps,
+                weight_bps: p.weight_bps,
+                approved: false,
+                approved_at: None,
+            });
+        }
+
+        // Update escrow with new participants
+        escrow.participants = normalized;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)), &escrow);
+
+        // Update vote weights
+        for p in escrow.participants.iter() {
+            env.storage().instance().set(
+                &DataKey::VoteWeight(escrow_id, p.address.clone()),
+                &p.share_bps,
+            );
+        }
+
+        Ok(())
+    }
+
+    // ── Feature: Refund to an alternate recipient address ────────────────────
+
+    /// Refunds an escrow to an alternate recipient instead of the original customer.
+    ///
+    /// This allows flexibility in cases where refunds need to go to a different address
+    /// (e.g., treasury, recovery address, or alternate payment processor).
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `caller` - Address of the caller (must be customer or merchant).
+    /// * `escrow_id` - Identifier for the escrow.
+    /// * `recipient` - Alternate address to receive the refund.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns `Err(Error)` when:
+    /// - Escrow not found
+    /// - Caller is not customer or merchant
+    /// - Escrow is in invalid state for refund
+    /// - Hold period not passed
+    pub fn refund_escrow_to(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "refund_escrow_to")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.customer != caller && escrow.merchant != caller {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let old_status = escrow.status.clone();
+        match escrow.status {
+            EscrowStatus::Locked => {
+                let current_time = env.ledger().timestamp();
+                if current_time < escrow.created_at + escrow.min_hold_period {
+                    return Err(Error::Escrow(EscrowError::ReleaseOnHoldPeriod));
+                }
+                escrow.status = EscrowStatus::Resolved;
+            }
+            EscrowStatus::Disputed => {
+                return Err(Error::Escrow(EscrowError::InvalidStatus));
+            }
+            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => {
+                return Err(Error::Escrow(EscrowError::AlreadyProcessed))
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
+
+        let refund_amount = escrow.amount.saturating_sub(escrow.released_amount);
+        EscrowContract::transfer_if_token_contract(
+            &env,
+            &escrow.token,
+            &recipient,
+            refund_amount,
+        )?;
+
+        EscrowResolved {
+            escrow_id,
+            released_to_merchant: false,
+            amount: refund_amount,
+        }
+        .publish(&env);
+
+        // Emit unified status change event
+        EscrowStatusChanged {
+            escrow_id,
+            old_status,
+            new_status: EscrowStatus::Resolved,
+            changed_by: caller.clone(),
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        // Issue #686: notify hooks
+        Self::invoke_escrow_hooks(&env, EscrowEventType::Refunded, escrow_id);
+        Self::invoke_escrow_hooks(&env, EscrowEventType::StatusChanged, escrow_id);
+
+        Ok(())
     }
 
     fn invoke_escrow_hooks(env: &Env, event_type: EscrowEventType, escrow_id: u64) {
